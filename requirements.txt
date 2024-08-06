@@ -1,0 +1,10 @@
+matplotlib
+napari[all]
+numpy<2.0
+scipy
+skan
+scikit-image
+splinebox
+tifffile
+tqdm
+git+https://github.com/EPFL-Center-for-Imaging/nellie.git
