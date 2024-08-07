@@ -287,7 +287,9 @@ def show_with_napari(img, pixel_size_um, splines_um, peaks_um):
 if __name__ == "__main__":
     pixel_size_um = np.array([0.2, 0.056, 0.056])
 
-    for folder in pathlib.Path("../test_folder").glob("*"):
+    # for folder in pathlib.Path("../test_folder").glob("*"):
+    for folder in pathlib.Path(r"C:/Users/landoni/Desktop/Skeletonization/Mito_nucleoid_distances-main/Mito_nucleoid_distances-main/Test").glob("*"):
+
         img_path = folder / f"{folder.stem}_decon.ome.tiff"
 
         # Create a folder where the profiles and normal plane
