@@ -1,23 +1,24 @@
+import collections
 import logging
 import pathlib
 
+import matplotlib.pyplot as plt
+import napari
 import nellie.im_info.im_info
 import nellie.segmentation.filtering
 import nellie.segmentation.labelling
 import nellie.segmentation.networking
-
-logger = logging.getLogger()
-logger.setLevel(level=logging.ERROR)
-
-import matplotlib.pyplot as plt
-import napari
 import numpy as np
+import pandas as pd
 import scipy
 import skan
 import skimage.io
 import splinebox
 import tifffile
 import tqdm
+
+logger = logging.getLogger()
+logger.setLevel(level=logging.ERROR)
 
 
 def segment_img_with_nellie(
@@ -55,35 +56,38 @@ def segment_img_with_nellie(
     return im_info
 
 
-def skeleton2splines(label_path, min_length_px, knots2data_ratio=5, extension_um=0):
+def label_img_to_binary_skeleton(label_img, min_length_px):
     """
     min_length_px : int
         Minimum length of sceleton segment in pixels.
         Shorter segments are discarded.
+    """
+    regionprops = skimage.measure.regionprops_table(label_img, properties=("area",))
+    selected_labels = np.where(regionprops["area"] > min_length_px)[0] + 1
+    binary_skeleton = np.isin(label_img, selected_labels)
+    return binary_skeleton
+
+
+def skeleton2splines(
+    binary_skeleton, pixel_size_um, knots2data_ratio=5, extension_um=0
+):
+    """
     knots2data : float
         The ration between the number of knots in the spline and
         the data points. The default is 5. This means a skeleton
         segment with 20 pixels would be approximated with a spline
         with 4 knots.
     """
-    if min_length_px // knots2data_ratio < 4:
-        raise RuntimeError(
-            f"Basis splines of order 3 need at least 4 knots. You have specified `min_length_px`={min_length_px} and `knots2data_ratio`={knots2data_ratio}. This results in a minimum number of knots of `min_length_px` // `knots2data_ratio` = {min_length_px // knots2data_ratio}. Please increase `min_length_px` or decrease `knots2data_ratio` to make sure all splines have at least 4 knots."
-        )
-
-    label_img = skimage.io.imread(label_path)
-
-    regionprops = skimage.measure.regionprops_table(label_img, properties=("area",))
-    selected_labels = np.where(regionprops["area"] > min_length_px)[0] + 1
-
-    binary_skeleton = np.isin(label_img, selected_labels)
-
     skeleton = skan.Skeleton(binary_skeleton)
 
     splines_um = []
 
     for i in tqdm.tqdm(range(skeleton.n_paths)):
         coordinates = skeleton.path_coordinates(i)
+        if len(coordinates) // knots2data_ratio < 4:
+            raise RuntimeError(
+                "Basis splines of order 3 need at least 4 knots. The minimum number of knots is determined by `min_length_px` // `knots2data_ratio`. Please increase `min_length_px` or decrease `knots2data_ratio` to make sure all splines have at least 4 knots."
+            )
         M = len(coordinates) // knots2data_ratio
         coordinates_um = coordinates * pixel_size_um
         spline_um = splinebox.Spline(M=M, basis_function=splinebox.B3(), closed=False)
@@ -111,9 +115,7 @@ def extend_spline(spline, extension):
     return spline
 
 
-def extract_normal_plane_imgs(
-    spline_um, t, img, pixel_size_um, half_window_size_um=0.5
-):
+def compute_normal_planes(spline_um, t, pixel_size_um, half_window_size_um=0.5):
     range_um = np.arange(-half_window_size_um, half_window_size_um, pixel_size_um[1])
     ii, jj = np.meshgrid(range_um, range_um)
 
@@ -131,13 +133,17 @@ def extract_normal_plane_imgs(
 
     spline_coordinates_um = spline_um.eval(t)
 
-    normal_plane_um = np.multiply.outer(ii, normal1_um) + np.multiply.outer(
+    normal_planes_um = np.multiply.outer(ii, normal1_um) + np.multiply.outer(
         jj, normal2_um
     )
-    normal_plane_um = np.rollaxis(normal_plane_um, 2, 0)
-    normal_plane_um += spline_coordinates_um[:, np.newaxis, np.newaxis]
+    normal_planes_um = np.rollaxis(normal_planes_um, 2, 0)
+    normal_planes_um += spline_coordinates_um[:, np.newaxis, np.newaxis]
 
-    normal_plane_px = normal_plane_um / pixel_size_um
+    return normal_planes_um
+
+
+def extract_normal_plane_imgs(normal_planes_um, img, pixel_size_um):
+    normal_plane_px = normal_planes_um / pixel_size_um
     shape = normal_plane_px.shape
     vals = scipy.ndimage.map_coordinates(
         img,
@@ -157,13 +163,12 @@ def extract_normal_plane_imgs(
     return vals
 
 
-def calculate_distances(spline_um, t_peaks):
-    distances_um = []
-    if len(t_peaks) > 1:
-        for t0, t1 in zip(t_peaks[:-1], t_peaks[1:]):
-            distance_um = spline_um.arc_length(t0, t1)
-            distances_um.append(distance_um)
-    return distances_um
+def calculate_distances_to_next(arc_lengths, peak_indices):
+    distances = np.zeros(len(t_nucleoids))
+    if len(peak_indices) > 1:
+        distances[:-1] = np.diff(arc_lengths[peak_indices])
+    distances[-1] = np.nan
+    return distances
 
 
 def gaussian(yx, amplitude, yo, xo, sigma_y, sigma_x, theta, offset):
@@ -221,10 +226,12 @@ def calculate_size(imgs):
     return sizes
 
 
-def plot_distance_histogram(distances_um, save=None):
+def plot_distance_histogram(distances_nm, save=None):
+    distances_nm = np.array(distances_nm)
+    distances_nm = distances_nm[~np.isnan(distances_nm)]
     plt.figure()
-    plt.hist(distances_um, bins=40)
-    plt.xlabel(r"Distance [$\mu$m]")
+    plt.hist(distances_nm, bins=40)
+    plt.xlabel("Distance [nm]")
     plt.tight_layout()
     if save is not None:
         plt.savefig(save)
@@ -244,14 +251,20 @@ def plot_size_distribution(sizes_um, save=None):
     plt.show()
 
 
-def plot_profile(vals, peak_indices, path):
-    plt.plot(vals, "x-")
-    plt.scatter(peak_indices, vals[peak_indices], color="red")
+def plot_profile(vals_nucleoids, peak_indices, vals_mitos, path):
+    fig, axes = plt.subplots(2, 1, sharex=True)
+    for i, vals in enumerate((vals_nucleoids, vals_mitos)):
+        axes[i].plot(vals, "x-")
+        axes[i].scatter(peak_indices, vals[peak_indices], color="red")
+    axes[0].set_ylabel("Nucleoid intensity along spline")
+    axes[1].set_ylabel("Mito intensity along spline")
     plt.savefig(path)
     plt.close()
 
 
-def show_with_napari(img, pixel_size_um, splines_um, peaks_um):
+def show_with_napari(
+    img, pixel_size_um, splines_um=None, nucleoids_px=None, normal_planes_um=None
+):
     viewer = napari.Viewer(ndisplay=3)
 
     viewer.add_image(
@@ -266,20 +279,26 @@ def show_with_napari(img, pixel_size_um, splines_um, peaks_um):
         scale=pixel_size_um,
     )
 
-    paths_um = []
-    for spline_um in splines_um:
-        t = np.linspace(0, spline_um.M - 1, spline_um.M * 10)
-        paths_um.append(spline_um.eval(t))
+    if not splines_um is None:
+        paths_um = []
+        for spline_um in splines_um:
+            t = np.linspace(0, spline_um.M - 1, spline_um.M * 10)
+            paths_um.append(spline_um.eval(t))
 
-    viewer.add_shapes(
-        paths_um,
-        shape_type="path",
-        edge_width=0.1,
-        edge_color="random-path-id",
-        edge_colormap="tab10",
-    )
+        viewer.add_shapes(
+            paths_um,
+            shape_type="path",
+            edge_width=0.1,
+            edge_color="random-path-id",
+            edge_colormap="tab10",
+        )
 
-    viewer.add_points(np.array(peaks_um), opacity=0.1, size=1)
+    if not nucleoids_px is None:
+        nucleoids_um = nucleoids_px * pixel_size_um
+        viewer.add_points(np.array(nucleoids_um), opacity=0.1, size=1)
+
+    if not normal_planes_um is None:
+        viewer.add_shapes(normal_planes_um, shape_type="rectangle", edge_width=0)
 
     napari.run()
 
@@ -287,9 +306,10 @@ def show_with_napari(img, pixel_size_um, splines_um, peaks_um):
 if __name__ == "__main__":
     pixel_size_um = np.array([0.2, 0.056, 0.056])
 
-    # for folder in pathlib.Path("../test_folder").glob("*"):
-    for folder in pathlib.Path(r"C:/Users/landoni/Desktop/Skeletonization/Mito_nucleoid_distances-main/Mito_nucleoid_distances-main/Test").glob("*"):
-
+    for folder in pathlib.Path("../test_folder").glob("*"):
+        # for folder in pathlib.Path(
+        #     r"C:/Users/landoni/Desktop/Skeletonization/Mito_nucleoid_distances-main/Mito_nucleoid_distances-main/Test"
+        # ).glob("*"):
         img_path = folder / f"{folder.stem}_decon.ome.tiff"
 
         # Create a folder where the profiles and normal plane
@@ -318,11 +338,15 @@ if __name__ == "__main__":
         # The path to the label image generated by nellie.
         label_path = nellie_output_dir / f"{img_path.stem}-ch{ch}-im_skel.ome.tif"
 
+        # Load the label image generated by nellie and turn it into a binary skeleton
+        label_img = skimage.io.imread(label_path)
+        binary_skeleton = label_img_to_binary_skeleton(label_img, min_length_px=20)
+
         # Turn the segments of the skeleton into splines
         knots2data_ratio = 5
         splines_um = skeleton2splines(
-            label_path,
-            min_length_px=20,
+            binary_skeleton,
+            pixel_size_um,
             knots2data_ratio=knots2data_ratio,
             extension_um=0.3,
         )
@@ -331,70 +355,171 @@ if __name__ == "__main__":
         img = tifffile.imread(img_path)
         # Select the channel with the nucleoids
         nucleoid_img = img[:, 0]
+        mito_img = img[:, 1]
 
         # Create some lists to collect the results
-        all_distances_um = []
-        all_peaks_um = []
-        all_sizes_um = []
+        line_profiles_df_data = collections.defaultdict(lambda: [])
+        nucleoids_df_data = collections.defaultdict(lambda: [])
 
-        for i, spline_um in enumerate(splines_um):
+        # In this list we store the planes we want to show
+        # in napari.
+        selected_normal_planes_um = []
+
+        for branch_id, spline_um in enumerate(splines_um):
+            branch_id += 1
             # These are the parameter values of the spline, where
             # the normal planes are calculated. To find the position
             # of the peaks along the spline more accurately,
             # decrease the step size.
             t = np.linspace(0, spline_um.M - 1, spline_um.M * knots2data_ratio * 2)
 
-            normal_imgs = extract_normal_plane_imgs(
-                spline_um, t, nucleoid_img, pixel_size_um, half_window_size_um=0.5
+            # n is the number of data points we will collect for this branch
+            n = len(t)
+
+            line_profiles_df_data["Branch_ID"].extend([branch_id] * n)
+
+            # Compute the total length of the spline
+            total_arc_length_um = spline_um.arc_length()
+            # Convert it to nanometers
+            total_arc_length_nm = total_arc_length_um * 1000
+            line_profiles_df_data["Branch_total_length_nm"].extend(
+                [total_arc_length_nm] * n
+            )
+
+            # Compute the length of the spline for each parameter value t
+            # (this takes a long time and can probably be sped up exploting the
+            # fact that t is monotonically increasing)
+            arc_lengths_um = np.array(list(map(spline_um.arc_length, t)))
+            arc_lengths_nm = arc_lengths_um * 1000
+            line_profiles_df_data["Length_nm"].extend(arc_lengths_nm)
+
+            # In this part we extract the positions of the pixels in the normal planes
+            normal_planes_um = compute_normal_planes(
+                spline_um, t, pixel_size_um, half_window_size_um=0.5
+            )
+
+            # We hold on to the corners of the middle normal plane so we can show
+            # them with napari
+            middle_idx = normal_planes_um.shape[0] // 2
+            selected_normal_planes_um.append(
+                normal_planes_um[
+                    (
+                        np.array((middle_idx, middle_idx, middle_idx, middle_idx)),
+                        np.array((0, 0, -1, -1)),
+                        np.array((0, -1, -1, 0)),
+                    )
+                ]
+            )
+
+            # Now we have to find the pixel values for each position in the normal planes
+            normal_imgs_nucleoid = extract_normal_plane_imgs(
+                normal_planes_um, nucleoid_img, pixel_size_um
+            )
+            normal_imgs_mito = extract_normal_plane_imgs(
+                normal_planes_um, mito_img, pixel_size_um
             )
 
             # Save the normal plane images (comment this line to save time)
-            tifffile.imwrite(debug_output_folder / f"{i}.tif", normal_imgs)
+            tifffile.imwrite(
+                debug_output_folder / f"nucleoid_{branch_id}.tif", normal_imgs_nucleoid
+            )
+            tifffile.imwrite(
+                debug_output_folder / f"mito_{branch_id}.tif", normal_imgs_mito
+            )
 
             # Reduce each normal plane image to a single representative value
             # We use nanmean because pixels of the nomal plane outside the
             # image bounds are nan values.
-            vals = np.nanmean(normal_imgs, axis=(1, 2))
+            intensity_nucleoid = np.nanmean(normal_imgs_nucleoid, axis=(1, 2))
+            intensity_mito = np.nanmean(normal_imgs_mito, axis=(1, 2))
+            line_profiles_df_data["Intensity_Mito"].extend(intensity_mito)
+            line_profiles_df_data["Intensity_Nucleoid"].extend(intensity_nucleoid)
 
             # Find the peaks in the along the plane
             # (check the find_peaks documentation to filter the peaks in a biological
             # meaningful way).
-            peak_indices, _ = scipy.signal.find_peaks(vals, prominence=200)
+            peak_indices, _ = scipy.signal.find_peaks(
+                intensity_nucleoid, prominence=200
+            )
+
+            # Creat an array with N and Y for the csv file
+            peak_yn = np.array(["N"] * n)
+            peak_yn[peak_indices] = "Y"
+            line_profiles_df_data["Peak_YN"].extend(peak_yn)
+
+            # Create the nucleoid_id column for the csv file for this branch
+            nucleoid_id = np.array([np.nan] * n)
+            nucleoid_id[peak_indices] = np.cumsum(np.ones(len(peak_indices)))
+            line_profiles_df_data["Nucleoid_ID"].extend(nucleoid_id)
 
             # Save the profile plot (comment this line to save time)
-            plot_profile(vals, peak_indices, debug_output_folder / f"{i}.tif")
+            plot_profile(
+                intensity_nucleoid,
+                peak_indices,
+                intensity_mito,
+                debug_output_folder / f"{branch_id}.png",
+            )
 
-            # Calculate the size of the nucleoid at each peak
-            sizes_px = calculate_size(normal_imgs[peak_indices])
-            if len(sizes_px) > 0:
-                sizes_um = sizes_px * pixel_size_um[1:]
-                all_sizes_um.extend(sizes_um)
+            # The number of nucleoids detected on this branch
+            n_nucleoids = len(peak_indices)
 
-            # Process the peak(s) if the current section has at least one
-            if len(peak_indices) > 0:
+            # Process the peak(s) if the current branch has at least one
+            if n_nucleoids > 0:
                 # Parameter values of the splines where the peak(s) are located
-                t_peaks = t[peak_indices]
+                t_nucleoids = t[peak_indices]
+
+                # Add the branch id, nucleoid_id and length to the data for the nucleoid csv
+                nucleoids_df_data["Branch_ID"].extend([branch_id] * n_nucleoids)
+                nucleoids_df_data["Nucleoid_ID"].extend(np.arange(n_nucleoids) + 1)
+                nucleoids_df_data["Length_nm"].extend(arc_lengths_nm[peak_indices])
+
+                # To calculate the distance to the next nucleoid we can use the fact
+                # that we have already computed the length for all paramters values t.
+                distances_to_next_nm = calculate_distances_to_next(
+                    arc_lengths_nm, peak_indices
+                )
+                nucleoids_df_data["Distance_to_next_nm"].extend(distances_to_next_nm)
 
                 # Location of the peaks in micrometers
-                peaks_um = spline_um.eval(t_peaks)
-
-                if peaks_um.ndim == 1:
+                nucleoids_um = spline_um.eval(t_nucleoids)
+                if nucleoids_um.ndim == 1:
                     # If there is only one peak, we have to add an axis to make
                     # things compatible.
-                    peaks_um = peaks_um[np.newaxis, :]
+                    nucleoids_um = nucleoids_um[np.newaxis, :]
+                # Save the pixel coordinates of each nucleoid to the data for the nucleoid csv
+                # so they can easily be found using Fiji.
+                nucleoids_df_data["z_px"].extend(nucleoids_um[:, 0] / pixel_size_um[0])
+                nucleoids_df_data["y_px"].extend(nucleoids_um[:, 1] / pixel_size_um[1])
+                nucleoids_df_data["x_px"].extend(nucleoids_um[:, 2] / pixel_size_um[2])
 
-                # Collecte the peak locations so they can be save as a csv later.
-                all_peaks_um.extend(peaks_um)
+        # Save the csv files
+        df = pd.DataFrame(nucleoids_df_data)
+        df["Filename"] = img_path.name
+        df.to_csv(folder / f"{img_path.stem}_Nucleoids.csv")
+        df = pd.DataFrame(line_profiles_df_data)
+        df["Filename"] = img_path.name
+        df.to_csv(folder / f"{img_path.stem}_LineProfiles.csv")
 
-                distances_um = calculate_distances(spline_um, t_peaks)
-
-                # Collecte the distances so they can be save as a csv later.
-                all_distances_um.extend(distances_um)
-
-        plot_distance_histogram(all_distances_um, save=folder / "distances.pdf")
-
-        plot_size_distribution(all_sizes_um, save=folder / "sizes.pdf")
+        # Plot and save the distance histogram
+        plot_distance_histogram(
+            nucleoids_df_data["Distance_to_next_nm"],
+            save=folder / f"{img_path.stem}_distances.pdf",
+        )
 
         # Showing the results with napari is useful for debugging but slow
-        # so you can comment this once you are happy with the results.
-        show_with_napari(img, pixel_size_um, splines_um, all_peaks_um)
+        # so you can comment this part once you are happy with the results.
+        nucleoids_px = np.stack(
+            [
+                nucleoids_df_data["z_px"],
+                nucleoids_df_data["y_px"],
+                nucleoids_df_data["x_px"],
+            ],
+            axis=-1,
+        )
+        show_with_napari(
+            img,
+            pixel_size_um,
+            splines_um,
+            nucleoids_px,
+            selected_normal_planes_um,
+        )
