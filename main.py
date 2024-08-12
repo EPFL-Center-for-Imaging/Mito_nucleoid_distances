@@ -4,7 +4,7 @@ import pathlib
 
 import matplotlib.pyplot as plt
 import napari
-import nellie.im_info.im_info
+import nellie.im_info.verifier
 import nellie.segmentation.filtering
 import nellie.segmentation.labelling
 import nellie.segmentation.networking
@@ -32,13 +32,18 @@ def segment_img_with_nellie(
     threshold=None,
     dim_order=None,
 ):
-    im_info = nellie.im_info.im_info.ImInfo(
-        str(img_path.resolve()),
-        ch=ch,
-        output_dirpath=str(output_dirpath),
-        dim_sizes=dim_sizes,
-        dimension_order=dim_order,
-    )
+    file_info = nellie.im_info.verifier.FileInfo(str(img_path.resolve()), output_dir=output_dirpath)
+    file_info.find_metadata()
+    file_info.load_metadata()
+    file_info.change_axes(dim_order)
+    file_info.change_dim_res("T", 1)
+    for dim in dim_order:
+        if dim == "C":
+            continue
+        file_info.change_dim_res(dim, dim_sizes[dim])
+    file_info.change_selected_channel(ch)
+
+    im_info = nellie.im_info.verifier.ImInfo(file_info)
 
     preprocessing = nellie.segmentation.filtering.Filter(
         im_info, num_t, remove_edges=remove_edges
